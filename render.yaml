@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: armony-streamlit
+    runtime: docker
+    repo: https://github.com/hatfieldandrea24/armony_app.git
+    branch: main
+    rootDir: .
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: MOTHERDUCK_TOKEN
+        sync: false
+      - key: MOTHERDUCK_DSN
+        sync: false
