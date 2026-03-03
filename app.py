@@ -247,6 +247,117 @@ def fetch_target_activity_bounds(conn_str: str) -> tuple[date, date]:
     return min_d, max_d
 
 
+@st.cache_data(show_spinner=False)
+def fetch_all_activity_bounds(conn_str: str) -> tuple[date, date]:
+    conn = get_connection(conn_str)
+    row = conn.execute(
+        LATEST_PERMIT_CTE
+        + """
+        select
+            min(activity_date) as min_activity_date,
+            max(activity_date) as max_activity_date
+        from permit_latest
+        where activity_date > date '1900-01-01'
+        """
+    ).fetchone()
+    today = date.today()
+    if not row or row[0] is None or row[1] is None:
+        return today - timedelta(days=365), today
+    min_d = row[0] if isinstance(row[0], date) else pd.to_datetime(row[0]).date()
+    max_d = row[1] if isinstance(row[1], date) else pd.to_datetime(row[1]).date()
+    return min_d, max_d
+
+
+def _search_mode_sql_and_params(search_mode: str, like_term: str) -> tuple[str, list[Any]]:
+    if search_mode == "Address":
+        return (
+            "concat_ws(' ', cast(l.street_no as varchar), l.street, l.city, l.jurisdiction, cast(l.zipcode as varchar)) ilike ?",
+            [like_term],
+        )
+    if search_mode == "Applicant":
+        return (
+            "(coalesce(l.applicant_name, '') ilike ? or coalesce(l.applicant_email, '') ilike ? or coalesce(l.applicant_phone, '') ilike ?)",
+            [like_term, like_term, like_term],
+        )
+    if search_mode == "Owner":
+        return (
+            "(coalesce(l.owner_name, '') ilike ? or coalesce(l.owner_email, '') ilike ? or coalesce(l.owner_phone, '') ilike ?)",
+            [like_term, like_term, like_term],
+        )
+    if search_mode == "Permit #":
+        return "coalesce(l.permit_number, '') ilike ?", [like_term]
+    return (
+        "("
+        "coalesce(l.permit_number, '') ilike ?"
+        " or concat_ws(' ', cast(l.street_no as varchar), l.street, l.city, l.jurisdiction, cast(l.zipcode as varchar)) ilike ?"
+        " or coalesce(l.owner_name, '') ilike ?"
+        " or coalesce(l.owner_email, '') ilike ?"
+        " or coalesce(l.applicant_name, '') ilike ?"
+        " or coalesce(l.applicant_email, '') ilike ?"
+        " or coalesce(l.description, '') ilike ?"
+        " or coalesce(l.type, '') ilike ?"
+        " or coalesce(l.subtype, '') ilike ?"
+        ")",
+        [like_term] * 9,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_global_search_results(
+    conn_str: str,
+    search_text: str,
+    search_mode: str,
+    start_date: str,
+    end_date: str,
+    result_limit: int,
+) -> pd.DataFrame:
+    term = search_text.strip()
+    if not term:
+        return pd.DataFrame()
+
+    conn = get_connection(conn_str)
+    mode_sql, mode_params = _search_mode_sql_and_params(search_mode, f"%{term}%")
+    params: list[Any] = [start_date, end_date] + mode_params + [result_limit]
+    sql = (
+        LATEST_PERMIT_CTE
+        + f"""
+        select
+            l.permit_number,
+            p.segment,
+            p.lead_priority,
+            l.activity_date,
+            l.file_date,
+            l.issue_date,
+            l.county,
+            l.jurisdiction,
+            l.city,
+            concat_ws(' ', cast(l.street_no as varchar), l.street) as address,
+            cast(l.zipcode as varchar) as zipcode,
+            l.status,
+            l.type,
+            l.subtype,
+            l.description,
+            l.job_value,
+            p.contractor_id,
+            p.contractor_group_id,
+            p.contractor_is_trade,
+            l.owner_name,
+            l.owner_email,
+            l.owner_phone,
+            l.applicant_name,
+            l.applicant_email,
+            l.applicant_phone
+        from permit_latest l
+        left join main.permit_segments p using (permit_number)
+        where l.activity_date between ? and ?
+          and {mode_sql}
+        order by l.activity_date desc nulls last, l.file_date desc nulls last
+        limit ?
+        """
+    )
+    return _lower_cols(conn.execute(sql, params).fetchdf())
+
+
 def _default_date_range(min_d: date, max_d: date, days: int = 180) -> tuple[date, date]:
     start = max(min_d, max_d - timedelta(days=days))
     return start, max_d
@@ -950,10 +1061,11 @@ default_counties = tuple(c for c in county_options if c.lower() in {"marin", "so
     county_options
 )
 
-overview_tab, opp_tab, comp_tab, property_tab, watch_tab, mom_tab = st.tabs(
+overview_tab, opp_tab, search_tab, comp_tab, property_tab, watch_tab, mom_tab = st.tabs(
     [
         "Overview",
         "Opportunities",
+        "Global Search",
         "Competitor Pulse",
         "Property Hotspots",
         "Watchlists",
@@ -1186,6 +1298,98 @@ with opp_tab:
             opp_df.to_csv(index=False).encode(),
             file_name="client_opportunities.csv",
         )
+
+
+with search_tab:
+    st.markdown(
+        """
+        **How to use this tab**
+        - Use one search bar to find permits by address, applicant, owner, or permit number.
+        - Apply the activity date range for time-boxed lookups, then export matching rows to CSV.
+        """
+    )
+    search_min_date, search_max_date = fetch_all_activity_bounds(conn_str)
+    search_default = _default_date_range(search_min_date, search_max_date, days=365)
+    if "global_search_request" not in st.session_state:
+        st.session_state["global_search_request"] = None
+
+    with st.form("global_search_form"):
+        s1, s2 = st.columns([1.8, 1])
+        with s1:
+            search_text = st.text_input(
+                "Search",
+                placeholder="Try an address, applicant name, owner name, or permit number",
+            )
+        with s2:
+            search_mode = st.selectbox(
+                "Search scope",
+                options=["All fields", "Address", "Applicant", "Owner", "Permit #"],
+                index=0,
+            )
+
+        search_start_date, search_end_date = st.slider(
+            "Activity date range",
+            min_value=search_min_date,
+            max_value=search_max_date,
+            value=search_default,
+            format="YYYY-MM-DD",
+            key="global_search_date_range",
+        )
+        result_limit = st.slider("Max rows", 50, 5000, 500, 50, key="global_search_limit")
+        run_search = st.form_submit_button("Search permits", use_container_width=True)
+
+    if run_search:
+        term = search_text.strip()
+        if len(term) < 2:
+            st.warning("Enter at least 2 characters to run search.")
+            st.session_state["global_search_request"] = None
+        else:
+            st.session_state["global_search_request"] = {
+                "search_text": term,
+                "search_mode": search_mode,
+                "start_date": search_start_date.isoformat(),
+                "end_date": search_end_date.isoformat(),
+                "result_limit": int(result_limit),
+            }
+
+    request = st.session_state.get("global_search_request")
+    if request:
+        search_df = fetch_global_search_results(
+            conn_str,
+            request["search_text"],
+            request["search_mode"],
+            request["start_date"],
+            request["end_date"],
+            int(request["result_limit"]),
+        )
+        st.write(f"{len(search_df):,} permits matched")
+        if search_df.empty:
+            st.info("No permits match the current search and date range.")
+        else:
+            g1, g2, g3 = st.columns(3)
+            g1.metric("Unique jurisdictions", f"{search_df['jurisdiction'].nunique(dropna=True):,}")
+            g2.metric("With applicant email", f"{search_df['applicant_email'].str.contains('@', na=False).sum():,}")
+            g3.metric("With owner email", f"{search_df['owner_email'].str.contains('@', na=False).sum():,}")
+
+            st.dataframe(
+                search_df,
+                width="stretch",
+                column_config={
+                    "permit_number": st.column_config.TextColumn("Permit #"),
+                    "activity_date": st.column_config.DateColumn("Activity date"),
+                    "file_date": st.column_config.DateColumn("File date"),
+                    "issue_date": st.column_config.DateColumn("Issue date"),
+                    "job_value": st.column_config.NumberColumn("Job value", format="dollar", step=1),
+                    "contractor_is_trade": st.column_config.CheckboxColumn("Trade"),
+                },
+            )
+            st.download_button(
+                "Download search results CSV",
+                search_df.to_csv(index=False).encode(),
+                file_name="permit_search_results.csv",
+            )
+    else:
+        st.caption("Run a search to view permit matches.")
 
 
 with comp_tab:
